@@ -606,3 +606,76 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+
+# Test checkpoint pre-pass/post-pass logic: verify that cached prompts
+# are correctly restored after checkpoint management (pre-pass erase,
+# restore search, post-pass erase).
+# Regression test for checkpoint logic in server-context.cpp
+def test_completion_checkpoint_restore():
+    global server
+    server.n_slots = 2
+    server.kv_unified = True
+    server.start()
+
+    # Phase 1: send prompts to populate cache with checkpoints
+    prompts = []
+    cache_hits = []
+    for i in range(8):
+        # Varying lengths to exercise different checkpoint positions
+        prompt_len = 20 + i * 10
+        prompt = f"Test prompt number {i} " * prompt_len
+        prompts.append(prompt)
+
+        res = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": prompt,
+                "n_predict": 4,
+            },
+        )
+        assert res.status_code == 200
+        assert "timings" in res.body
+        timings = res.body["timings"]
+
+        # First run: full prompt processing (no cache hit yet)
+        assert timings["prompt_n"] > 0
+        cache_n = timings.get("cache_n", 0)
+        cache_hits.append(cache_n)
+
+    # Phase 2: repeat same prompts - should hit cache
+    for i, prompt in enumerate(prompts):
+        res = server.make_request(
+            "POST",
+            "/completion",
+            data={
+                "prompt": prompt,
+                "n_predict": 4,
+            },
+        )
+        assert res.status_code == 200
+        timings = res.body["timings"]
+
+        # Second run: should have cache hit (cache_n > 0)
+        # This verifies checkpoint pre-pass/post-pass didn't corrupt the cache
+        assert timings.get("cache_n", 0) > 0, f"Prompt {i}: expected cache hit but cache_n={timings.get('cache_n', 0)}"
+        # Total tokens should still add up
+        assert timings["prompt_n"] + timings["cache_n"] == len(prompt.split()) * 6
+        assert timings["predicted_n"] == 4
+
+    # Phase 3: send a NEW prompt - should still work correctly
+    new_prompt = "This is a completely new prompt " * 30
+    res = server.make_request(
+        "POST",
+        "/completion",
+        data={
+            "prompt": new_prompt,
+            "n_predict": 4,
+        },
+    )
+    assert res.status_code == 200
+    assert "content" in res.body
+    assert len(res.body["content"]) > 0
+    assert res.body["timings"]["predicted_n"] == 4

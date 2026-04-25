@@ -729,9 +729,10 @@ private:
         }
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+        // evict old entries before allocating new ones to avoid peak memory spike
+        prompt_cache->update();
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
-        prompt_cache->update();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1171,6 +1172,9 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
+                // evict old entries before allocating new ones to avoid peak memory spike
+                prompt_cache->update();
+
                 // don't save the slot's state if its context is empty
                 if (tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
@@ -1179,8 +1183,6 @@ private:
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear(false);
                 }
-
-                prompt_cache->update();
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2492,6 +2494,22 @@ private:
                                 if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
+                                    // pre-pass: erase checkpoints that are guaranteed unusable
+                                    // before copying them into the cache entry via prompt_save()
+                                    // this reduces peak memory by freeing dead checkpoint memory early
+                                    for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                        const auto & cur = *it;
+                                        // checkpoint extends beyond current position or won't match restore search
+                                        if (cur.pos_max > pos_next || (cur.pos_min >= pos_min_thold && cur.pos_min != 0)) {
+                                            SLT_DBG(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %"
+PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens,
+                                                n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                            it = slot.prompt.checkpoints.erase(it);
+                                        } else {
+                                            ++it;
+                                        }
+                                    }
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -2531,18 +2549,19 @@ private:
                                 }
                             }
 
-                            {
-                                // erase any checkpoints with pos_max > pos_next
-                                for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-                                    const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
-                                        it = slot.prompt.checkpoints.erase(it);
-                                    } else {
-                                        ++it;
-                                    }
+                            // post-pass: erase checkpoints invalidated by pos_next changes during restore
+                            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                                const auto & cur = *it;
+                                if (cur.pos_max > pos_next) {
+                                    SLT_DBG(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %"
+PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens,
+                                        n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                    it = slot.prompt.checkpoints.erase(it);
+                                } else {
+                                    ++it;
                                 }
                             }
+
                         }
 
                         // [TAG_PROMPT_LOGITS]
