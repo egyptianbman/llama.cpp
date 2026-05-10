@@ -220,6 +220,8 @@ struct server_slot {
         n_draft_accepted = 0;
 
         task_prev = std::move(task);
+        // clear checkpoint debris from cancelled tasks
+        prompt.checkpoints.clear();
         task.reset();
 
         llama_set_sampler(ctx, id, nullptr);
